@@ -215,7 +215,7 @@ def ping():
     _increment_requests()
     host = request.args.get("host", "localhost")
     # BAD: user-controlled string passed to the shell
-    output = subprocess.check_output(f"ping -c 1 {host}", shell=True)  # nosec-disabled
+    output = subprocess.check_output(f"ping -c 1 {host}", shell=True)
     return jsonify({"output": output.decode(errors="ignore")})
 
 
