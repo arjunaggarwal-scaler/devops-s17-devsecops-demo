@@ -196,6 +196,30 @@ def calculate():
 
 
 # ─────────────────────────────────────────────────────────
+#  DEMO ONLY - deliberately INSECURE endpoint
+#  (introduced to prove the Security Gate BLOCKS the pipeline;
+#   reverted before merge - see README "Blocked vs Passed" section)
+# ─────────────────────────────────────────────────────────
+
+import subprocess  # noqa: E402
+
+
+@app.route("/api/ping")
+def ping():
+    """INSECURE on purpose: builds a shell command from user input.
+
+    Bandit flags B602 (subprocess_popen_with_shell_equals_true) and the
+    custom Semgrep rule s17-subprocess-shell-true fires (CWE-78 command
+    injection). This is exactly what the Security Gate must block.
+    """
+    _increment_requests()
+    host = request.args.get("host", "localhost")
+    # BAD: user-controlled string passed to the shell
+    output = subprocess.check_output(f"ping -c 1 {host}", shell=True)  # nosec-disabled
+    return jsonify({"output": output.decode(errors="ignore")})
+
+
+# ─────────────────────────────────────────────────────────
 #  Pipeline Simulator API  (mirrors the real GitHub Actions flow)
 # ─────────────────────────────────────────────────────────
 
