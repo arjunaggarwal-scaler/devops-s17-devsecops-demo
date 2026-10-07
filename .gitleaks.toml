@@ -1,0 +1,30 @@
+# Gitleaks configuration - secret scanning of the FULL git history
+# Used as:  gitleaks git . --config .gitleaks.toml
+# Gate policy: ANY finding blocks the pipeline (a leaked secret must be rotated, not ignored).
+
+title = "devops-s17-devsecops-demo secret scanning rules"
+
+# Start from the ~200 built-in gitleaks rules (AWS, GitHub, GCP, Slack, private keys, JWT, ...)
+[extend]
+useDefault = true
+
+# Extra rule: catch generic credentials assigned to *_API_KEY / *_SECRET / *_PASSWORD / *_TOKEN
+# variables in code, .env files or YAML, e.g.  DB_PASSWORD = "S0meth1ngL0ng..."
+[[rules]]
+id = "s17-generic-credential-assignment"
+description = "Literal value assigned to an API key / secret / password / token variable"
+regex = '''(?i)\b[a-z0-9_]*(?:api_key|apikey|secret|password|passwd|token)\b\s*[:=]\s*["']([a-z0-9_\-/+=!@#$%^&*.]{12,})["']'''
+secretGroup = 1
+entropy = 3.2
+keywords = ["api_key", "apikey", "secret", "password", "passwd", "token"]
+
+# Global allowlist - only things that can never contain real secrets
+[allowlist]
+description = "Generated scanner reports and obvious placeholders"
+paths = [
+  '''(^|/)reports/''',
+  '''\.sarif$''',
+]
+regexes = [
+  '''(?i)(replace[-_]?with|changeme|example|placeholder|dummy|xxxxxxxx)''',
+]

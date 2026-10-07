@@ -1,0 +1,11 @@
+# .trivyignore - accepted risks for Trivy (fs + image scans)
+#
+# Policy: an entry is only allowed with (1) the CVE/check ID, (2) a justification,
+# (3) an owner and (4) an expiry date. Expired entries must be re-reviewed.
+# The gate already ignores vulnerabilities that have NO fix available
+# (--ignore-unfixed) because there is nothing we can upgrade to.
+#
+# Format:
+# CVE-YYYY-NNNNN   # reason | owner | exp:YYYY-MM-DD
+#
+# (currently no accepted risks - the image passes the HIGH/CRITICAL gate without exceptions)

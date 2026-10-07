@@ -1,0 +1,16 @@
+# Bandit (SAST for Python) configuration
+# Used as:  bandit -c bandit.yaml -r app
+#
+# Gate policy (enforced in the "Security Gate" job, not by bandit itself):
+#   BLOCK  = severity MEDIUM or HIGH  AND  confidence MEDIUM or HIGH
+#   REPORT = everything else (e.g. B311 'random' used for non-crypto UI data is LOW)
+
+# Tests use 'assert' on purpose (B101) - they are not shipped in the image.
+exclude_dirs:
+  - tests
+  - venv
+  - .venv
+
+# No checks are skipped globally; individual, justified exceptions must use
+# an inline "# nosec BXXX" comment so they stay visible in code review.
+skips: []

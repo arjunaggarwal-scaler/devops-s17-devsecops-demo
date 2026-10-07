@@ -1,0 +1,150 @@
+import pytest
+from app.app import app
+
+
+# ── Setup ──────────────────────────────────────────────
+
+@pytest.fixture
+def client():
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        yield client
+
+
+# ── Test 1: Home page loads ────────────────────────────
+
+def test_home(client):
+    response = client.get("/")
+    assert response.status_code == 200
+
+
+# ── Test 2: Health check returns healthy ───────────────
+
+def test_health(client):
+    response = client.get("/health")
+    assert response.status_code == 200
+
+    data = response.get_json()
+    assert data["status"] == "healthy"
+
+
+# ── Test 3: Greet returns 200 and includes the name ───
+
+def test_greet(client):
+    response = client.get("/api/greet/Arjun")
+    assert response.status_code == 200
+
+    data = response.get_json()
+    # The response contains a random greeting — just check the name is in it
+    assert "Arjun" in data["message"]
+
+
+# ── Test 4: Add numbers returns correct result ─────────
+
+def test_add_numbers(client):
+    response = client.post(
+        "/api/add",
+        json={"number1": 10, "number2": 20}
+    )
+    assert response.status_code == 200
+
+    data = response.get_json()
+    assert data["result"] == 30
+
+
+# ── Test 5: Add numbers — missing fields returns 400 ──
+
+def test_add_numbers_missing_fields(client):
+    response = client.post(
+        "/api/add",
+        json={"number1": 5}   # number2 is missing
+    )
+    assert response.status_code == 400
+
+
+# ── Test 6: Calculator — multiply ─────────────────────
+
+def test_calculator_multiply(client):
+    response = client.post(
+        "/api/calculate",
+        json={"a": 4, "b": 5, "operation": "multiply"}
+    )
+    assert response.status_code == 200
+
+    data = response.get_json()
+    assert data["result"] == 20
+
+
+# ── Test 7: Calculator — divide by zero ───────────────
+
+def test_calculator_divide_by_zero(client):
+    response = client.post(
+        "/api/calculate",
+        json={"a": 10, "b": 0, "operation": "divide"}
+    )
+    assert response.status_code == 400
+
+
+# ── Test 8: Status API ─────────────────────────────────
+
+def test_status(client):
+    response = client.get("/api/status")
+    assert response.status_code == 200
+
+    data = response.get_json()
+    assert data["status"] == "running"
+    assert "python_version" in data
+    assert "uptime" in data
+
+# ── Test 9: Status exposes build metadata (used by the deploy smoke test) ──
+
+def test_status_has_version_and_git_sha(client):
+    data = client.get("/api/status").get_json()
+    assert data["version"] == "3.0.0"
+    assert "git_sha" in data
+
+
+# ── Test 10: Security headers are set on every response ──
+
+def test_security_headers(client):
+    response = client.get("/health")
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
+    assert response.headers["Referrer-Policy"] == "no-referrer"
+
+
+# ── Test 11: Unknown route returns JSON 404 ──
+
+def test_unknown_route_returns_404(client):
+    response = client.get("/does-not-exist")
+    assert response.status_code == 404
+    assert response.get_json()["code"] == 404
+
+
+# ── Test 12: Calculator rejects unknown operations / bad input ──
+
+@pytest.mark.parametrize("payload", [
+    {"a": 1, "b": 2, "operation": "rm -rf"},
+    {"a": "x", "b": 2, "operation": "add"},
+    {},
+])
+def test_calculator_rejects_bad_input(client, payload):
+    response = client.post("/api/calculate", json=payload)
+    assert response.status_code == 400
+
+
+# ── Test 13: Pipeline simulator mirrors the real 10-stage pipeline ──
+
+def test_pipeline_simulator_stages(client):
+    response = client.post("/api/pipeline/run", json={"fail_chance": 0})
+    data = response.get_json()
+    assert response.status_code == 200
+    assert data["overall_status"] == "passed"
+    names = [s["name"] for s in data["stages"]]
+    assert names[0] == "Build" and names[-1] == "Deploy to Kubernetes"
+    assert "Security Gate" in names
+
+
+def test_pipeline_simulator_rejects_bad_fail_chance(client):
+    response = client.post("/api/pipeline/run", json={"fail_chance": "abc"})
+    assert response.status_code == 400

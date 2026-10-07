@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: devsecops-demo
+  namespace: devsecops-demo
+  labels:
+    app.kubernetes.io/name: devsecops-demo
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: devsecops-demo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

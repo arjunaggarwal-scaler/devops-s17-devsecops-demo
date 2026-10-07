@@ -1,0 +1,589 @@
+# =============================================================================
+#  Session 17 - Complete CI/CD + DevSecOps pipeline
+#
+#  Code -> Build -> Unit Test -> SAST -> SCA -> Secret Scan -> Docker Build
+#       -> Container Image Scan -> Security Gate -> Push Image -> Deploy to K8s
+#
+#  Design:
+#   * Every stage is its own job and depends on the previous one (needs:).
+#   * Scanners REPORT (they always upload JSON/SARIF reports and expose the
+#     number of blocking findings as job outputs). The Security Gate job is the
+#     single place that ENFORCES the policy and fails the pipeline.
+#   * The exact image tarball built in "Docker Build" is the one that is
+#     scanned, pushed to GHCR and deployed (by digest) - nothing is rebuilt.
+# =============================================================================
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devsecops-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/arjunaggarwal-scaler/devops-s17-devsecops-demo
+  LOCAL_IMAGE: devsecops-demo:ci
+  TRIVY_IMAGE: aquasec/trivy:0.75.0
+  GITLEAKS_VERSION: "8.30.1"
+  SEMGREP_VERSION: "1.179.0"
+  BANDIT_VERSION: "1.9.4"
+  PIP_AUDIT_VERSION: "2.10.1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. BUILD - install pinned deps, byte-compile, make sure the WSGI app imports
+  # ---------------------------------------------------------------------------
+  build:
+    name: "1. Build"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install runtime dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Compile application (syntax check)
+        run: python -m compileall -q app && echo "compileall OK"
+
+      - name: Verify the WSGI app loads and list its routes
+        run: |
+          python - <<'EOF'
+          from app.app import app
+          rules = sorted(r.rule for r in app.url_map.iter_rules())
+          print(f"Flask app '{app.name}' loaded with {len(rules)} routes:")
+          for r in rules:
+              print("  ", r)
+          EOF
+
+      - name: Package build output
+        run: |
+          mkdir -p dist
+          tar czf dist/app-${{ github.sha }}.tar.gz app requirements.txt
+          ls -lh dist/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-build
+          path: dist/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 2. UNIT TEST - pytest + coverage (fails below 80 %)
+  # ---------------------------------------------------------------------------
+  unit-test:
+    name: "2. Unit Test"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dev dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run unit tests with coverage
+        run: |
+          mkdir -p reports
+          pytest -v --cov=app --cov-report=term-missing \
+                 --cov-report=xml:reports/coverage.xml \
+                 --junitxml=reports/junit.xml \
+                 --cov-fail-under=80
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-reports
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # 3. SAST - Bandit + Semgrep (+ CodeQL to the Security tab, + Trivy IaC config)
+  # ---------------------------------------------------------------------------
+  sast:
+    name: "3. SAST (Bandit, Semgrep, CodeQL)"
+    needs: unit-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # upload SARIF to the Security tab
+      actions: read
+    outputs:
+      bandit_blocking: ${{ steps.bandit.outputs.blocking }}
+      semgrep_blocking: ${{ steps.semgrep.outputs.blocking }}
+      iac_blocking: ${{ steps.iac.outputs.blocking }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install SAST tools
+        run: python -m pip install "bandit[sarif]==${BANDIT_VERSION}" "semgrep==${SEMGREP_VERSION}"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: python
+          build-mode: none
+          queries: security-extended
+
+      - name: Bandit - Python security linter
+        id: bandit
+        run: |
+          mkdir -p reports
+          bandit -c bandit.yaml -r app -f json  -o reports/bandit.json  --exit-zero -q
+          bandit -c bandit.yaml -r app -f sarif -o reports/bandit.sarif --exit-zero -q
+          bandit -c bandit.yaml -r app --exit-zero          # human readable log
+          # policy: severity >= MEDIUM and confidence >= MEDIUM blocks
+          BLOCKING=$(jq '[.results[] | select((.issue_severity=="MEDIUM" or .issue_severity=="HIGH") and (.issue_confidence=="MEDIUM" or .issue_confidence=="HIGH"))] | length' reports/bandit.json)
+          TOTAL=$(jq '.results | length' reports/bandit.json)
+          echo "blocking=$BLOCKING" >> "$GITHUB_OUTPUT"
+          echo "### Bandit: $TOTAL finding(s), $BLOCKING blocking (MEDIUM+ severity & confidence)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Semgrep - custom rules + p/python + p/flask
+        id: semgrep
+        run: |
+          semgrep scan --config .semgrep.yml --config p/python --config p/flask \
+                       --metrics=off --text \
+                       --json-output=reports/semgrep.json \
+                       --sarif-output=reports/semgrep.sarif
+          BLOCKING=$(jq '[.results[] | select(.extra.severity=="ERROR" or .extra.severity=="HIGH" or .extra.severity=="CRITICAL")] | length' reports/semgrep.json)
+          TOTAL=$(jq '.results | length' reports/semgrep.json)
+          echo "blocking=$BLOCKING" >> "$GITHUB_OUTPUT"
+          echo "### Semgrep: $TOTAL finding(s), $BLOCKING blocking (severity ERROR/HIGH/CRITICAL)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Trivy config - Dockerfile & Kubernetes misconfigurations (IaC)
+        id: iac
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" config --skip-dirs reports \
+            --severity HIGH,CRITICAL --format json --output reports/trivy-config.json .
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" convert \
+            --format sarif --output reports/trivy-config.sarif reports/trivy-config.json
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" config --skip-dirs reports \
+            --severity MEDIUM,HIGH,CRITICAL --format table .
+          BLOCKING=$(jq '[.Results[]?.Misconfigurations[]? | select(.Status=="FAIL")] | length' reports/trivy-config.json)
+          echo "blocking=$BLOCKING" >> "$GITHUB_OUTPUT"
+          echo "### Trivy config (IaC): $BLOCKING HIGH/CRITICAL misconfiguration(s)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: CodeQL analysis (results go to the Security tab)
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:python"
+
+      - name: Upload Bandit SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/bandit.sarif
+          category: bandit
+
+      - name: Upload Semgrep SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/semgrep.sarif
+          category: semgrep
+
+      - name: Upload Trivy config SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/trivy-config.sarif
+          category: trivy-config
+
+      - name: Upload SAST reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sast-reports
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # 4. SCA - known-vulnerable dependencies (pip-audit + Trivy filesystem)
+  # ---------------------------------------------------------------------------
+  sca:
+    name: "4. SCA (pip-audit, Trivy fs)"
+    needs: sast
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      pip_audit_blocking: ${{ steps.pipaudit.outputs.blocking }}
+      trivy_fs_blocking: ${{ steps.trivyfs.outputs.blocking }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pip-audit
+        run: python -m pip install "pip-audit==${PIP_AUDIT_VERSION}"
+
+      - name: pip-audit - PyPI advisory DB / OSV
+        id: pipaudit
+        run: |
+          mkdir -p reports
+          pip-audit -r requirements.txt --desc on --format json --output reports/pip-audit.json || true
+          pip-audit -r requirements.txt --format cyclonedx-json --output reports/sbom-python-deps.cdx.json || true
+          pip-audit -r requirements.txt --desc off --format columns || true      # human readable log
+          BLOCKING=$(jq '[.dependencies[].vulns[]?] | length' reports/pip-audit.json)
+          echo "blocking=$BLOCKING" >> "$GITHUB_OUTPUT"
+          echo "### pip-audit: $BLOCKING known vulnerabilit(y/ies) in pinned dependencies" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Trivy fs - dependency vulnerabilities (HIGH/CRITICAL)
+        id: trivyfs
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" fs --skip-dirs reports \
+            --scanners vuln --severity HIGH,CRITICAL --ignorefile .trivyignore \
+            --format json --output reports/trivy-fs.json .
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" convert \
+            --format sarif --output reports/trivy-fs.sarif reports/trivy-fs.json
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" convert \
+            --format table reports/trivy-fs.json
+          BLOCKING=$(jq '[.Results[]?.Vulnerabilities[]?] | length' reports/trivy-fs.json)
+          echo "blocking=$BLOCKING" >> "$GITHUB_OUTPUT"
+          echo "### Trivy fs: $BLOCKING HIGH/CRITICAL vulnerable dependenc(y/ies)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Trivy fs SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Upload SCA reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sca-reports
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # 5. SECRET SCAN - Gitleaks over the FULL git history
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: "5. Secret Scan (Gitleaks)"
+    needs: sca
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      gitleaks_blocking: ${{ steps.gitleaks.outputs.blocking }}
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0          # every commit, not just the last one
+
+      - name: Install Gitleaks (checksum verified)
+        run: |
+          cd "$RUNNER_TEMP"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -sSfLO "$base/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfLO "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
+          tar xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
+          sudo install gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Gitleaks - scan all commits
+        id: gitleaks
+        run: |
+          mkdir -p reports
+          echo "Commits in history: $(git rev-list --count HEAD)"
+          gitleaks git . --config .gitleaks.toml --redact --verbose --exit-code 0 \
+                   --report-format json  --report-path reports/gitleaks.json
+          gitleaks git . --config .gitleaks.toml --redact --exit-code 0 --no-banner \
+                   --report-format sarif --report-path reports/gitleaks.sarif
+          BLOCKING=$(jq 'length' reports/gitleaks.json)
+          echo "blocking=$BLOCKING" >> "$GITHUB_OUTPUT"
+          echo "### Gitleaks: $BLOCKING secret(s) found in $(git rev-list --count HEAD) commits" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Gitleaks SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/gitleaks.sarif
+          category: gitleaks
+
+      - name: Upload secret-scan report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: secret-scan-reports
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # 6. DOCKER BUILD - build once, smoke-test the container, hand over a tarball
+  # ---------------------------------------------------------------------------
+  docker-build:
+    name: "6. Docker Build"
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: |
+          docker build --pull \
+            --build-arg GIT_SHA=${{ github.sha }} \
+            -t "$LOCAL_IMAGE" .
+          docker image ls "$LOCAL_IMAGE"
+          docker image inspect "$LOCAL_IMAGE" --format 'User={{.Config.User}}  Cmd={{json .Config.Cmd}}'
+
+      - name: Smoke-test the container
+        run: |
+          docker run -d --name smoke -p 5001:5001 --read-only --tmpfs /tmp --cap-drop ALL "$LOCAL_IMAGE"
+          for i in $(seq 1 20); do curl -fsS http://localhost:5001/health && break; sleep 1; done
+          echo
+          curl -fsS http://localhost:5001/api/status | jq .
+          docker logs smoke | tail -5
+          docker rm -f smoke
+
+      - name: Save image as tarball
+        run: docker save "$LOCAL_IMAGE" -o image.tar && ls -lh image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-image
+          path: image.tar
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 7. CONTAINER IMAGE SCAN - Trivy image (OS packages + Python libs + secrets)
+  # ---------------------------------------------------------------------------
+  image-scan:
+    name: "7. Container Image Scan (Trivy)"
+    needs: docker-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      image_blocking: ${{ steps.trivy.outputs.blocking }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: docker-image
+
+      - name: Trivy image scan
+        id: trivy
+        run: |
+          mkdir -p reports
+          T="docker run --rm -v $PWD:/src -w /src $TRIVY_IMAGE"
+          # gate report: HIGH/CRITICAL with a fix available, plus any embedded secret
+          $T image --input image.tar --scanners vuln,secret \
+             --severity HIGH,CRITICAL --ignore-unfixed --ignorefile .trivyignore \
+             --format json --output reports/trivy-image.json
+          $T convert --format sarif --output reports/trivy-image.sarif reports/trivy-image.json
+          $T convert --format table reports/trivy-image.json
+          # informational: full picture of all severities (incl. unfixed) + SBOM
+          $T image --input image.tar --scanners vuln --format json --output reports/trivy-image-all.json
+          $T image --input image.tar --format cyclonedx --output reports/sbom-image.cdx.json
+          echo "All severities (informational):"
+          jq -r '[.Results[]?.Vulnerabilities[]?.Severity] | group_by(.) | map("\(.[0])=\(length)") | join("  ")' reports/trivy-image-all.json
+          BLOCKING=$(jq '[.Results[]? | (.Vulnerabilities[]?, .Secrets[]?)] | length' reports/trivy-image.json)
+          echo "blocking=$BLOCKING" >> "$GITHUB_OUTPUT"
+          echo "### Trivy image: $BLOCKING fixable HIGH/CRITICAL vulnerabilit(y/ies) or secret(s)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Trivy image SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/trivy-image.sarif
+          category: trivy-image
+
+      - name: Upload image-scan reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-scan-reports
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # 8. SECURITY GATE - the single policy decision point
+  # ---------------------------------------------------------------------------
+  security-gate:
+    name: "8. Security Gate"
+    needs: [build, unit-test, sast, sca, secret-scan, docker-build, image-scan]
+    if: always()   # evaluate even if something upstream failed -> explicit red gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate security policy
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+          BANDIT: ${{ needs.sast.outputs.bandit_blocking }}
+          SEMGREP: ${{ needs.sast.outputs.semgrep_blocking }}
+          IAC: ${{ needs.sast.outputs.iac_blocking }}
+          PIPAUDIT: ${{ needs.sca.outputs.pip_audit_blocking }}
+          TRIVYFS: ${{ needs.sca.outputs.trivy_fs_blocking }}
+          GITLEAKS: ${{ needs.secret-scan.outputs.gitleaks_blocking }}
+          IMAGE: ${{ needs.image-scan.outputs.image_blocking }}
+        run: |
+          fail=0
+          row() {   # name, policy, value
+            local v="${3:-n/a}"
+            if [ "$v" = "0" ]; then s="PASS"; else s="BLOCK"; fail=1; fi
+            printf '| %s | %s | %s | %s |\n' "$1" "$2" "$v" "$s" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+          {
+            echo "## Security Gate"
+            echo
+            echo "| Check | Blocking policy | Blocking findings | Result |"
+            echo "|---|---|---|---|"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          row "SAST - Bandit"           "severity>=MEDIUM & confidence>=MEDIUM" "$BANDIT"
+          row "SAST - Semgrep"          "severity ERROR (or HIGH/CRITICAL)"     "$SEMGREP"
+          row "IaC - Trivy config"      "HIGH/CRITICAL misconfiguration"        "$IAC"
+          row "SCA - pip-audit"         "any known vulnerability"               "$PIPAUDIT"
+          row "SCA - Trivy fs"          "HIGH/CRITICAL"                         "$TRIVYFS"
+          row "Secrets - Gitleaks"      "any secret in full history"            "$GITLEAKS"
+          row "Image - Trivy"           "fixable HIGH/CRITICAL or secret"       "$IMAGE"
+          echo
+          echo "Upstream job results: $RESULTS"
+          if echo "$RESULTS" | grep -qvE '"success"|^\[|^\]'; then
+            echo "::error::An upstream job did not succeed - gate closed."
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::SECURITY GATE FAILED - image will NOT be pushed or deployed."
+            echo "**Gate: FAILED - push and deploy blocked**" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "SECURITY GATE PASSED - image may be published."
+          echo "**Gate: PASSED**" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 9. PUSH IMAGE - only after the gate passed, only from main
+  # ---------------------------------------------------------------------------
+  push-image:
+    name: "9. Push Image (GHCR)"
+    needs: [security-gate]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Download scanned image
+        uses: actions/download-artifact@v8
+        with:
+          name: docker-image
+
+      - name: Load image
+        run: docker load -i image.tar
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push (sha + latest)
+        id: push
+        run: |
+          SHORT=${GITHUB_SHA::7}
+          for tag in "${{ github.sha }}" "sha-$SHORT" latest; do
+            docker tag "$LOCAL_IMAGE" "$IMAGE_NAME:$tag"
+            docker push "$IMAGE_NAME:$tag"
+          done
+          DIGEST=$(docker image inspect "$IMAGE_NAME:${{ github.sha }}" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Pushed $IMAGE_NAME@$DIGEST"
+          echo "### Pushed \`$IMAGE_NAME:${{ github.sha }}\`  (digest \`$DIGEST\`)" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 10. DEPLOY - kind cluster inside the runner, deploy by digest, smoke test
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: "10. Deploy to Kubernetes (kind)"
+    needs: [push-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.15.1
+        with:
+          cluster_name: s17-ci
+
+      - name: Create namespace and GHCR pull secret
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl -n devsecops-demo create secret docker-registry ghcr-pull \
+            --docker-server=ghcr.io --docker-username="${{ github.actor }}" \
+            --docker-password="${{ secrets.GITHUB_TOKEN }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Render manifest with the gated image digest
+        run: |
+          IMAGE="$IMAGE_NAME@${{ needs.push-image.outputs.digest }}"
+          sed -i "s|__IMAGE__|$IMAGE|" k8s/deployment.yaml
+          grep -n "image:" k8s/deployment.yaml
+
+      - name: Apply manifests
+        run: kubectl apply -f k8s/
+
+      - name: Wait for rollout
+        run: kubectl -n devsecops-demo rollout status deployment/devsecops-demo --timeout=180s
+
+      - name: Show resources
+        if: always()
+        run: |
+          kubectl -n devsecops-demo get deploy,rs,pods,svc,endpointslices -o wide
+          kubectl -n devsecops-demo get pods -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+
+      - name: Smoke test through the Service
+        run: |
+          kubectl -n devsecops-demo port-forward service/devsecops-demo 8080:80 >/tmp/pf.log 2>&1 &
+          for i in $(seq 1 20); do curl -fsS http://localhost:8080/health && break; sleep 1; done
+          echo
+          STATUS=$(curl -fsS http://localhost:8080/api/status)
+          echo "$STATUS" | jq .
+          test "$(echo "$STATUS" | jq -r .git_sha)" = "${{ github.sha }}" && echo "Deployed git_sha matches ${{ github.sha }}"
+          curl -fsS http://localhost:8080/ | grep -o "<title>.*</title>"
+          curl -fsS -X POST -H 'Content-Type: application/json' -d '{"a":6,"b":7,"operation":"multiply"}' http://localhost:8080/api/calculate | jq -c .
+          echo "### Deployed \`${{ github.sha }}\` to kind - smoke test passed" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Debug on failure
+        if: failure()
+        run: |
+          kubectl -n devsecops-demo describe pods | tail -60
+          kubectl -n devsecops-demo logs -l app.kubernetes.io/name=devsecops-demo --tail=50 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -30

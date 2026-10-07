@@ -1,0 +1,79 @@
+# Custom Semgrep rules for this repository (run together with the public p/python ruleset).
+# Gate policy: any finding with severity ERROR blocks the pipeline; WARNING/INFO are reported only.
+rules:
+  - id: s17-subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >-
+      subprocess called with shell=True. If any part of the command comes from user
+      input this is OS command injection (CWE-78). Pass an argument list and keep shell=False.
+    metadata:
+      cwe: "CWE-78: OS Command Injection"
+      category: security
+    pattern-either:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+      - pattern: os.system(...)
+      - pattern: os.popen(...)
+
+  - id: s17-eval-exec
+    languages: [python]
+    severity: ERROR
+    message: eval()/exec() executes arbitrary code (CWE-95). Parse the data explicitly instead.
+    metadata:
+      cwe: "CWE-95: Eval Injection"
+      category: security
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: s17-flask-debug-true
+    languages: [python]
+    severity: ERROR
+    message: Flask debug mode exposes the Werkzeug interactive debugger (remote code execution).
+    metadata:
+      cwe: "CWE-489: Active Debug Code"
+      category: security
+    pattern: $APP.run(..., debug=True, ...)
+
+  - id: s17-unsafe-yaml-load
+    languages: [python]
+    severity: ERROR
+    message: yaml.load() with a non-safe Loader can construct arbitrary Python objects. Use yaml.safe_load().
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      category: security
+    patterns:
+      - pattern: yaml.load(...)
+      - pattern-not: yaml.load(..., Loader=yaml.SafeLoader, ...)
+      - pattern-not: yaml.load(..., Loader=yaml.CSafeLoader, ...)
+
+  - id: s17-pickle-loads
+    languages: [python]
+    severity: ERROR
+    message: pickle deserialization of untrusted data leads to code execution.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      category: security
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: pickle.load(...)
+
+  - id: s17-hardcoded-flask-secret-key
+    languages: [python]
+    severity: WARNING
+    message: Flask SECRET_KEY is hard-coded. Load it from an environment variable / Kubernetes Secret.
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      category: security
+    pattern-either:
+      - pattern: $APP.config["SECRET_KEY"] = "..."
+      - pattern: $APP.secret_key = "..."
+
+  - id: s17-requests-verify-false
+    languages: [python]
+    severity: WARNING
+    message: TLS certificate verification disabled.
+    metadata:
+      cwe: "CWE-295: Improper Certificate Validation"
+      category: security
+    pattern: requests.$METHOD(..., verify=False, ...)
