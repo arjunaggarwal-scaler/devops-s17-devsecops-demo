@@ -35,9 +35,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: app
-          # __IMAGE__ is replaced by the pipeline with ghcr.io/<owner>/<repo>@sha256:<digest>
+          # The pipeline replaces ":__TAG__" with "@sha256:<digest>" of the image it just pushed
           # (deploying by digest = exactly the image that passed the security gate)
-          image: __IMAGE__
+          image: ghcr.io/arjunaggarwal-scaler/devops-s17-devsecops-demo:__TAG__
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

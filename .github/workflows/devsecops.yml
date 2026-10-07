@@ -46,7 +46,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: "1. Build"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -93,7 +93,7 @@ jobs:
   unit-test:
     name: "2. Unit Test"
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -126,7 +126,7 @@ jobs:
   sast:
     name: "3. SAST (Bandit, Semgrep, CodeQL)"
     needs: unit-test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       security-events: write   # upload SARIF to the Security tab
@@ -228,7 +228,7 @@ jobs:
   sca:
     name: "4. SCA (pip-audit, Trivy fs)"
     needs: sast
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       security-events: write
@@ -289,7 +289,7 @@ jobs:
   secret-scan:
     name: "5. Secret Scan (Gitleaks)"
     needs: sca
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       security-events: write
@@ -345,7 +345,7 @@ jobs:
   docker-build:
     name: "6. Docker Build"
     needs: secret-scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -382,7 +382,7 @@ jobs:
   image-scan:
     name: "7. Container Image Scan (Trivy)"
     needs: docker-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       security-events: write
@@ -437,7 +437,7 @@ jobs:
     name: "8. Security Gate"
     needs: [build, unit-test, sast, sca, secret-scan, docker-build, image-scan]
     if: always()   # evaluate even if something upstream failed -> explicit red gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Evaluate security policy
         env:
@@ -490,7 +490,7 @@ jobs:
     name: "9. Push Image (GHCR)"
     needs: [security-gate]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -531,7 +531,7 @@ jobs:
   deploy:
     name: "10. Deploy to Kubernetes (kind)"
     needs: [push-image]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: read
@@ -553,8 +553,8 @@ jobs:
 
       - name: Render manifest with the gated image digest
         run: |
-          IMAGE="$IMAGE_NAME@${{ needs.push-image.outputs.digest }}"
-          sed -i "s|__IMAGE__|$IMAGE|" k8s/deployment.yaml
+          DIGEST="${{ needs.push-image.outputs.digest }}"
+          sed -i "s|$IMAGE_NAME:__TAG__|$IMAGE_NAME@$DIGEST|" k8s/deployment.yaml
           grep -n "image:" k8s/deployment.yaml
 
       - name: Apply manifests
